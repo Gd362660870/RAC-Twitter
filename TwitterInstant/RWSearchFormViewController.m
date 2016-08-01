@@ -1,0 +1,195 @@
+//
+//  RWSearchFormViewController.m
+//  TwitterInstant
+//
+//  Created by Colin Eberhardt on 02/12/2013.
+//  Copyright (c) 2013 Colin Eberhardt. All rights reserved.
+//
+
+#import <ReactiveCocoa/ReactiveCocoa.h>
+#import <ReactiveCocoa/RACEXTScope.h>
+#import "RWSearchFormViewController.h"
+#import "RWSearchResultsViewController.h"
+#import <Accounts/Accounts.h>
+#import <Social/Social.h>
+#import "RWTweet.h"
+#import "NSArray+LinqExtensions.h"
+
+typedef NS_ENUM(NSInteger, RWTwitterInstantError) {
+    RWTwitterInstantErrorAccessDenied,
+    RWTwitterInstantErrorNoTwitterAccounts,
+    RWTwitterInstantErrorInvalidResponse
+};
+
+static NSString * const RWTwitterInstantDomain = @"TwitterInstant";
+
+@interface RWSearchFormViewController ()
+
+@property(weak, nonatomic) IBOutlet UITextField *searchText;
+
+@property(strong, nonatomic)
+    RWSearchResultsViewController *resultsViewController;
+
+@property (strong, nonatomic) ACAccountStore *accountStore;
+@property (strong, nonatomic) ACAccountType *twitterAccountType;
+
+@end
+
+@implementation RWSearchFormViewController
+
+- (void)viewDidLoad {
+  [super viewDidLoad];
+    
+  self.title = @"Twitter Instant";
+
+  [self styleTextField:self.searchText];
+
+  self.resultsViewController = self.splitViewController.viewControllers[1];
+    
+  
+    @weakify(self)
+  [[self.searchText.rac_textSignal 	map:^id(NSString *value) {
+      
+    return [value length] > 2 ? [UIColor whiteColor] : [UIColor colorWithRed:0.980 green:1.000 blue:0.750 alpha:1.000];
+
+  }] subscribeNext:^(id x) {
+      @strongify(self)
+    self.searchText.backgroundColor = x;
+  }];
+    
+    self.accountStore = [[ACAccountStore alloc] init];
+    self.twitterAccountType = [self.accountStore accountTypeWithAccountTypeIdentifier:ACAccountTypeIdentifierTwitter];
+
+    
+    
+    [[[[[[[self requestAccessToTwitterSignal]
+          then:^RACSignal *{
+              @strongify(self)
+              return self.searchText.rac_textSignal;
+          }]
+         filter:^BOOL(NSString *text) {
+             return text.length > 2;
+         }]
+        throttle:0.5]
+       flattenMap:^RACStream *(NSString *text) {
+           @strongify(self)
+           return [self signalForSearchWithText:text];
+       }]
+      deliverOn:[RACScheduler mainThreadScheduler]]
+     subscribeNext:^(NSDictionary *jsonSearchResult) {
+         NSArray *statuses = jsonSearchResult[@"statuses"];
+         NSArray *tweets = [statuses linq_select:^id(id tweet) {
+             return [RWTweet tweetWithStatus:tweet];
+         }];
+         [self.resultsViewController displayTweets:tweets];
+     } error:^(NSError *error) {
+         NSLog(@"An error occurred: %@", error);
+     }];
+    
+ 
+ 
+
+
+}
+
+
+//这个方法通过v1.1 REST API创建了一个搜索Twitter的请求。关于这个API，可以在Twitter API docs中查看更多信息。
+- (SLRequest *)requestforTwitterSearchWithText:(NSString *)text
+{
+    NSURL *url = [NSURL URLWithString:@"https://api.twitter.com/1.1/search/tweets.json"];
+    NSDictionary *params = @{@"q": text};
+    
+    SLRequest *request = [SLRequest requestForServiceType:SLServiceTypeTwitter
+                                            requestMethod:SLRequestMethodGET
+                                                      URL:url
+                                               parameters:params];
+    return request;
+}
+
+
+
+- (RACSignal *)signalForSearchWithText:(NSString *)text {
+    // 定义错误
+    NSError *noAccountError = [NSError errorWithDomain:RWTwitterInstantDomain code:RWTwitterInstantErrorNoTwitterAccounts userInfo:nil];
+    
+    NSError *invalidResponseError = [NSError errorWithDomain:RWTwitterInstantDomain code:RWTwitterInstantErrorInvalidResponse userInfo:nil];
+    
+    // 创建信号block
+    @weakify(self)
+    return [RACSignal createSignal:^RACDisposable *(id<RACSubscriber> subscriber) {
+        @strongify(self)
+        
+        // 创建请求
+        SLRequest *request = [self requestforTwitterSearchWithText:text];
+        
+        
+        
+        // 提供Twitter账户
+        NSArray *twitterAccounts = [self.accountStore accountsWithAccountType:self.twitterAccountType];
+        if (twitterAccounts.count == 0) {
+            [subscriber sendError:noAccountError];
+        } else {
+            [request setAccount:[twitterAccounts lastObject]];
+            
+            // 执行请求
+            
+           
+            [request performRequestWithHandler:^(NSData *responseData, NSHTTPURLResponse *urlResponse, NSError *error) {
+                if (urlResponse.statusCode == 200) {
+                    // 成功，解析响应
+                    NSDictionary *timelineData = [NSJSONSerialization JSONObjectWithData:responseData options:NSJSONReadingAllowFragments error:nil];
+                    [subscriber sendNext:timelineData];
+                    [subscriber sendCompleted];
+                } else {
+                    // 失败，发送一个错误
+                    [subscriber sendError:invalidResponseError];
+                }
+            }];
+        }
+        
+        return nil;
+    }];
+}
+
+
+//请求访问推特信号
+- (RACSignal *)requestAccessToTwitterSignal
+{
+    // 定义一个错误，如果用户拒绝访问则发送
+    NSError *accessError = [NSError errorWithDomain:RWTwitterInstantDomain code:RWTwitterInstantErrorAccessDenied userInfo:nil];
+    
+    // 创建并返回信号
+    @weakify(self)
+    return [RACSignal createSignal:^RACDisposable *(id<RACSubscriber> subscriber) {
+        
+        // 请求访问twitter
+        @strongify(self)
+        [self.accountStore requestAccessToAccountsWithType:self.twitterAccountType
+                                                   options:nil
+                                                completion:^(BOOL granted, NSError *error) {
+                                                    // 处理响应
+                                                    if (!granted)
+                                                    {
+                                                        [subscriber sendError:accessError];
+                                                    }
+                                                    else
+                                                    {
+                                                        [subscriber sendNext:nil];
+                                                        [subscriber sendCompleted];
+                                                    }
+                                                }];
+        return nil;
+    }];
+}
+
+- (void)styleTextField:(UITextField *)textField {
+    CALayer *textFieldLayer = textField.layer;
+    textFieldLayer.borderColor = [UIColor grayColor].CGColor;
+    textFieldLayer.borderWidth = 2.0f;
+    textFieldLayer.cornerRadius = 0.0f;
+}
+
+        
+            
+
+@end
